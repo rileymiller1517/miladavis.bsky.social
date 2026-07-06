@@ -18,10 +18,26 @@ from atproto_client.utils import TextBuilder
 RUN_TAG      = os.getenv("GITHUB_RUN_ID") or f"{socket.gethostname()}-{uuid.uuid4().hex[:8]}"
 CLAIM_PREFIX = "CLAIMED_"
 
+# Identity of the repo/runner executing this job right now — used for:
+#   (a) the soft cross-repo posting lock (LOCKED_BY / LOCKED_AT columns)
+#   (b) the *permanent* account-row assignment (ASSIGNED_REPO / ASSIGNED_STATUS
+#       columns) — see resolve_account_row() below.
+CURRENT_REPO     = os.getenv("GITHUB_REPOSITORY") or f"local-{socket.gethostname()}"
+LOCK_TTL_MINUTES = 45  # longer than the 30-min internal post loop, so an
+                        # actively-running job keeps refreshing its own lock
+
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  ENV HELPERS
+#  ENV / VALUE PARSING HELPERS
 # ═══════════════════════════════════════════════════════════════════════════
+#
+#  These parsing rules are shared by two sources of configuration:
+#    - a handful of true per-runner knobs that still come from GitHub
+#      (currently just ACCOUNT_ROW, and only when explicitly set), read via
+#      get_*_env()
+#    - everything else, which now comes from Sheet1 columns and is read via
+#      the _parse_* functions directly, refreshed every cycle in
+#      load_account_config()
 
 def get_env(name, required=True):
     v = os.getenv(name)
@@ -31,55 +47,65 @@ def get_env(name, required=True):
         return ""
     return v.strip()
 
-def get_float_env(name, default):
-    raw = os.getenv(name)
-    if not raw or not raw.strip():
+def _parse_bool(raw, default=False):
+    if raw is None or not str(raw).strip():
         return default
-    raw = raw.strip().rstrip("%")
+    return str(raw).strip().lower() in ("1", "true", "yes", "on")
+
+def _parse_pct(raw, default):
+    """Parses values meant as a share/percentage, e.g. '60' -> 0.60, '0.6' -> 0.6."""
+    if raw is None or not str(raw).strip():
+        return default
+    raw = str(raw).strip().rstrip("%")
     try:
         v = float(raw)
         return v / 100.0 if v > 1 else v
     except ValueError:
         return default
 
-def get_bool_env(name, default=False):
-    raw = os.getenv(name)
-    if not raw or not raw.strip():
-        return default
-    return raw.strip().lower() in ("1", "true", "yes", "on")
-
-def get_int_env(name, default):
-    raw = os.getenv(name)
-    if not raw or not raw.strip():
+def _parse_plain_float(raw, default):
+    """Parses a plain numeric value (NOT a percentage) — e.g. MAX_IMAGE_MB=2 -> 2.0."""
+    if raw is None or not str(raw).strip():
         return default
     try:
-        return max(1, int(raw.strip()))
+        return float(str(raw).strip())
     except ValueError:
         return default
+
+def _parse_int(raw, default):
+    if raw is None or not str(raw).strip():
+        return default
+    try:
+        return max(1, int(str(raw).strip()))
+    except ValueError:
+        return default
+
+def get_bool_env(name, default=False):
+    return _parse_bool(os.getenv(name), default)
+
+def get_float_env(name, default):
+    return _parse_pct(os.getenv(name), default)
+
+def get_int_env(name, default):
+    return _parse_int(os.getenv(name), default)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  STATIC WORKFLOW KNOBS
 # ═══════════════════════════════════════════════════════════════════════════
+#
+#  ACCOUNT_ROW is resolved in one of two ways:
+#    - If the ACCOUNT_ROW env var is explicitly set (e.g. you typed a row
+#      number into the workflow_dispatch input, or set a repo variable)
+#      it's used as-is — a manual override.
+#    - Otherwise it's auto-resolved at startup by resolve_account_row():
+#      each repo remembers/claims its own free row in Sheet1 automatically.
+#      See that function for details.
+#
+#  The module-level value below is just a placeholder used until main()
+#  overwrites it with the resolved row at startup.
 
-_ri = get_float_env("IMAGE_RATIO", 0.60)
-_rv = get_float_env("VIDEO_RATIO", 0.40)
-_rs = _ri + _rv
-IMAGE_RATIO = (_ri / _rs) if _rs > 0 else 0.60
-VIDEO_RATIO = (_rv / _rs) if _rs > 0 else 0.40
-
-HASHTAGS_ENABLED_IMAGE = get_bool_env("HASHTAGS_ENABLED_IMAGE", True)
-HASHTAGS_ENABLED_VIDEO = get_bool_env("HASHTAGS_ENABLED_VIDEO", False)
-MAX_IMAGE_BYTES        = int(get_float_env("MAX_IMAGE_MB", 2.0) * 1024 * 1024)
-ENABLE_REPORT          = get_bool_env("ENABLE_REPORT", False)
-ACCOUNT_ROW            = get_int_env("ACCOUNT_ROW", 1)   # 1-based data row (header is row 0)
-TOP_POSTS_COUNT        = get_int_env("TOP_POSTS_COUNT", 5)    # how many top posts to report
-TOP_POSTS_WITHIN       = get_int_env("TOP_POSTS_WITHIN", 30)  # scan last N posts
-
-# ── Link-in-post controls ───────────────────────────────────────────────────
-LINK_ENABLED_IMAGE = get_bool_env("LINK_ENABLED_IMAGE", True)
-LINK_ENABLED_VIDEO = get_bool_env("LINK_ENABLED_VIDEO", True)
-LINK_PERCENTAGE    = get_float_env("LINK_PERCENTAGE", 1.0)  # 1.0 = 100% by default
+ACCOUNT_ROW = get_int_env("ACCOUNT_ROW", 1)   # 1-based data row (header is row 0)
 
 # ── Drive listing / pagination ──────────────────────────────────────────────
 DRIVE_PAGE_SIZE = 1000  # max allowed by Drive API per page
@@ -97,9 +123,12 @@ GOOGLE_TOKEN_SHARED_TOKEN = get_env("GOOGLE_TOKEN_SHARED_TOKEN", required=False)
 #  SPREADSHEETS
 # ═══════════════════════════════════════════════════════════════════════════
 
-# Master sheet: Sheet1 = credentials, Report = daily stats + top posts
+# Master sheet: Sheet1 = per-account credentials, Settings = shared live
+# knobs (image/video ratio, hashtags, link, report, etc.), Report = daily
+# stats + top posts.
 MASTER_SHEET_ID = "1d1ua2bzBt94omZxYgfwZhSJ94PJwAzc6clWpSVumebw"
 CREDS_TAB       = "Sheet1"
+SETTINGS_TAB    = "Settings"
 REPORT_TAB      = "Report"
 
 # 12-column report header (A:L)
@@ -112,6 +141,10 @@ REPORT_HEADER = [
 # Post-plan sheet (separate spreadsheet)
 POST_PLAN_SHEET_ID  = "1juum0RextNq44mrBN1Uu7ceSZA2V4Tmb9_oly3EORmA"
 POSTED_STATUS_VALUE = "posted"
+
+# Values written into the Sheet1 'ASSIGNED_STATUS' column by the
+# auto-assignment logic (see resolve_account_row()).
+ASSIGN_STATUS_IN_USE = "In Use"
 
 _URL_RE     = re.compile(r"https?://\S+")
 _MENTION_RE = re.compile(r"@\S+")
@@ -183,24 +216,199 @@ def get_sheets_service():
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  ACCOUNT CONFIG  — from Sheet1, row ACCOUNT_ROW (row 1 = first data row
-#  i.e. the second actual spreadsheet row, since row 1 is the header)
+#  SHEET CELL HELPERS
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _col_letter(idx0):
+    idx, letters = idx0 + 1, ""
+    while idx > 0:
+        idx, rem = divmod(idx - 1, 26)
+        letters  = chr(65 + rem) + letters
+    return letters
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  AUTO ACCOUNT-ROW ASSIGNMENT
+#  Lets you drop this script into any number of repos without ever typing a
+#  row number. Each repo claims the next free (not "In Use") Sheet1 row the
+#  first time it runs, marks it "In Use" with its own repo name, and reuses
+#  that same row on every future run — including manual (workflow_dispatch)
+#  runs, as long as ACCOUNT_ROW is left blank.
 # ═══════════════════════════════════════════════════════════════════════════
 #
-#  Expected Sheet1 header (case-insensitive):
-#  BSKY_HANDLE | BSKY_APP_PW | LINK_URL | LINK_DISPLAY_TEXT |
-#  HASHTAGS | UPLOAD_FOLDER_ID | PROCESSED_FOLDER_ID
+#  Requires two extra Sheet1 columns (case-insensitive), anywhere in the
+#  header row, alongside your existing BSKY_HANDLE / BSKY_APP_PW / etc:
+#
+#    ASSIGNED_REPO   — filled in automatically with the owning repo
+#                       (e.g. "yourname/bluesky-account-3")
+#    ASSIGNED_STATUS — filled in automatically with "In Use" once claimed
+#
+#  A third column, ASSIGNED_AT, is optional and purely informational (just
+#  records when the row was claimed).
+#
+#  To free up a row again (e.g. an account was deleted/retired), just clear
+#  its ASSIGNED_REPO and ASSIGNED_STATUS cells in the sheet — the next repo
+#  that runs with no explicit ACCOUNT_ROW will pick it up.
+#
+#  If you ever want to pin a specific repo to a specific row on purpose, set
+#  ACCOUNT_ROW explicitly (workflow_dispatch input, or a repo variable) —
+#  that always wins and skips all of this.
 
-_account_config = None
+def resolve_account_row():
+    explicit = get_env("ACCOUNT_ROW", required=False)
+    if explicit:
+        row = _parse_int(explicit, 1)
+        print(f"ACCOUNT_ROW={row} was explicitly set — using it as a manual override "
+              f"(auto-assignment skipped).")
+        return row
 
-def load_account_config():
-    global _account_config
-    if _account_config is not None:
+    service = get_sheets_service()
+    values  = service.spreadsheets().values().get(
+        spreadsheetId=MASTER_SHEET_ID, range=CREDS_RANGE
+    ).execute().get("values", [])
+
+    if len(values) < 2:
+        raise RuntimeError(f"'{CREDS_TAB}' has no data rows to auto-assign.")
+
+    header = [h.strip().upper() for h in values[0]]
+
+    def hidx(*names):
+        for n in names:
+            if n in header:
+                return header.index(n)
+        return None
+
+    handle_idx = hidx("BSKY_HANDLE")
+    repo_idx   = hidx("ASSIGNED_REPO")
+    status_idx = hidx("ASSIGNED_STATUS")
+    at_idx     = hidx("ASSIGNED_AT")
+
+    if handle_idx is None or repo_idx is None or status_idx is None:
+        raise RuntimeError(
+            f"Auto row-assignment needs 'BSKY_HANDLE', 'ASSIGNED_REPO' and "
+            f"'ASSIGNED_STATUS' columns in '{CREDS_TAB}' (optionally "
+            f"'ASSIGNED_AT' too). Add any missing ones to the header row, or "
+            f"set ACCOUNT_ROW manually for this run."
+        )
+
+    def cell(row, idx):
+        return row[idx].strip() if idx is not None and len(row) > idx else ""
+
+    # 1) Does this repo already own a row? If so, always reuse it.
+    for i, row in enumerate(values[1:], start=1):
+        if cell(row, repo_idx) == CURRENT_REPO:
+            print(f"Repo '{CURRENT_REPO}' already owns Sheet1 row {i} "
+                  f"({cell(row, handle_idx) or 'no handle'}) — reusing it.")
+            return i
+
+    # 2) Otherwise claim the first free (non "In Use") row that actually
+    #    has an account configured in it.
+    for i, row in enumerate(values[1:], start=1):
+        handle_val = cell(row, handle_idx)
+        status_val = cell(row, status_idx)
+        if not handle_val:
+            continue  # blank/unconfigured row — nothing to claim
+        if status_val.lower() == ASSIGN_STATUS_IN_USE.lower():
+            continue  # already claimed by some other repo
+        _claim_account_row(service, i, repo_idx, status_idx, at_idx)
+        print(f"Claimed Sheet1 row {i} ({handle_val}) for repo '{CURRENT_REPO}'.")
+        return i
+
+    raise RuntimeError(
+        f"No available account rows left in '{CREDS_TAB}' — every configured "
+        f"row is already marked '{ASSIGN_STATUS_IN_USE}'. Add a new account "
+        f"row, or clear ASSIGNED_REPO/ASSIGNED_STATUS on one you want to free up."
+    )
+
+
+def _claim_account_row(service, data_idx, repo_idx, status_idx, at_idx):
+    sheet_row = data_idx + 1  # +1 because row 1 in the sheet is the header
+    now       = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+    data = [
+        {"range": f"{CREDS_TAB}!{_col_letter(repo_idx)}{sheet_row}",   "values": [[CURRENT_REPO]]},
+        {"range": f"{CREDS_TAB}!{_col_letter(status_idx)}{sheet_row}", "values": [[ASSIGN_STATUS_IN_USE]]},
+    ]
+    if at_idx is not None:
+        data.append({"range": f"{CREDS_TAB}!{_col_letter(at_idx)}{sheet_row}", "values": [[now]]})
+
+    service.spreadsheets().values().batchUpdate(
+        spreadsheetId=MASTER_SHEET_ID,
+        body={"valueInputOption": "RAW", "data": data},
+    ).execute()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  ACCOUNT CONFIG + LIVE SETTINGS — from Sheet1, row ACCOUNT_ROW (row 1 =
+#  first data row, i.e. the second actual spreadsheet row, since row 1 is
+#  the header). Re-read fresh from the sheet every posting cycle so that
+#  edits you make in Google Sheets take effect on the very next post.
+# ═══════════════════════════════════════════════════════════════════════════
+#
+#  Expected Sheet1 header (case-insensitive), per-account identity only:
+#
+#  BSKY_HANDLE | BSKY_APP_PW | LINK_URL | LINK_DISPLAY_TEXT | HASHTAGS |
+#  UPLOAD_FOLDER_ID | PROCESSED_FOLDER_ID |
+#  LOCKED_BY | LOCKED_AT   (optional — cross-repo posting-collision lock) |
+#  ASSIGNED_REPO | ASSIGNED_STATUS | ASSIGNED_AT   (optional — needed only
+#                            for auto row-assignment, see resolve_account_row())
+#
+#  Expected Settings tab: two columns, KEY | VALUE, one row per setting,
+#  shared by every account unless a row in Sheet1 overrides it with its own
+#  column of the same name:
+#
+#  IMAGE_RATIO | VIDEO_RATIO | HASHTAGS_ENABLED_IMAGE | HASHTAGS_ENABLED_VIDEO |
+#  LINK_ENABLED_IMAGE | LINK_ENABLED_VIDEO | LINK_PERCENTAGE | MAX_IMAGE_MB |
+#  ENABLE_REPORT | TOP_POSTS_COUNT | TOP_POSTS_WITHIN | POST_PLAN_SHEET_NAME
+#
+#  Any value can be left blank — a sensible built-in default is used.
+#  The Settings tab is entirely optional too: if it doesn't exist yet,
+#  everything just falls back to built-in defaults.
+
+CREDS_RANGE = f"{CREDS_TAB}!A:Z"
+
+_account_config         = None
+_creds_lock_col_by      = None
+_creds_lock_col_at      = None
+_global_settings_cache  = None
+
+
+def load_global_settings(force_refresh=False):
+    """Reads the shared, vertical KEY | VALUE 'Settings' tab. Missing tab or
+    any read error just means we fall back to built-in defaults — never fatal."""
+    global _global_settings_cache
+    if _global_settings_cache is not None and not force_refresh:
+        return _global_settings_cache
+
+    settings = {}
+    try:
+        service = get_sheets_service()
+        result  = service.spreadsheets().values().get(
+            spreadsheetId=MASTER_SHEET_ID, range=f"{SETTINGS_TAB}!A:B"
+        ).execute()
+        values = result.get("values", [])
+        for row in values[1:]:  # skip the KEY/VALUE header row
+            if len(row) >= 1 and row[0].strip():
+                key = row[0].strip().upper()
+                val = row[1].strip() if len(row) > 1 else ""
+                settings[key] = val
+    except Exception as exc:
+        print(f"Note: '{SETTINGS_TAB}' tab not found or unreadable — using built-in "
+              f"defaults for shared settings ({exc}).")
+
+    _global_settings_cache = settings
+    return _global_settings_cache
+
+
+def load_account_config(force_refresh=False):
+    global _account_config, _creds_lock_col_by, _creds_lock_col_at
+
+    if _account_config is not None and not force_refresh:
         return _account_config
 
     service = get_sheets_service()
     result  = service.spreadsheets().values().get(
-        spreadsheetId=MASTER_SHEET_ID, range=f"{CREDS_TAB}!A:G"
+        spreadsheetId=MASTER_SHEET_ID, range=CREDS_RANGE
     ).execute()
     values = result.get("values", [])
 
@@ -210,7 +418,7 @@ def load_account_config():
             "Add at least one account data row."
         )
 
-    # ACCOUNT_ROW=1 → values index 1 (first data row after the header)
+    # ACCOUNT_ROW=1 -> values index 1 (first data row after the header)
     data_idx = ACCOUNT_ROW
     if data_idx >= len(values):
         raise RuntimeError(
@@ -230,9 +438,28 @@ def load_account_config():
                 continue
         return ""
 
+    # Remember which columns hold the soft-lock fields, if present, so we
+    # can write heartbeats back to the right cells later.
+    _creds_lock_col_by = header.index("LOCKED_BY") if "LOCKED_BY" in header else None
+    _creds_lock_col_at = header.index("LOCKED_AT") if "LOCKED_AT" in header else None
+
+    # Shared, live-tunable knobs come from the Settings tab. A row in Sheet1
+    # can still override any of these for just that one account by adding a
+    # column of the same name — a per-row value always wins over the shared
+    # Settings tab value, which wins over the built-in default.
+    shared = load_global_settings(force_refresh)
+    def setting(key):
+        return col(key) or shared.get(key, "")
+
     raw_link     = col("LINK_URL") or "https://foodiesposts.com"
     link_url     = raw_link if raw_link.startswith("http") else f"https://{raw_link}"
     link_display = col("LINK_DISPLAY_TEXT") or link_url.replace("https://","").replace("http://","")
+
+    img_ratio_raw = _parse_pct(setting("IMAGE_RATIO"), 0.60)
+    vid_ratio_raw = _parse_pct(setting("VIDEO_RATIO"), 0.40)
+    ratio_sum     = img_ratio_raw + vid_ratio_raw
+    image_ratio   = (img_ratio_raw / ratio_sum) if ratio_sum > 0 else 0.60
+    video_ratio   = (vid_ratio_raw / ratio_sum) if ratio_sum > 0 else 0.40
 
     cfg = {
         "handle":              col("BSKY_HANDLE"),
@@ -243,6 +470,26 @@ def load_account_config():
         "upload_folder_id":    col("UPLOAD_FOLDER_ID"),
         "processed_folder_id": col("PROCESSED_FOLDER_ID"),
         "row_num":             ACCOUNT_ROW,
+
+        # Live-tunable settings — edit these in the sheet any time; they
+        # take effect on the next posting cycle (checked every ~30 min
+        # while a job is running, and again on every new scheduled run).
+        "image_ratio":              image_ratio,
+        "video_ratio":              video_ratio,
+        "hashtags_enabled_image":   _parse_bool(setting("HASHTAGS_ENABLED_IMAGE"), True),
+        "hashtags_enabled_video":   _parse_bool(setting("HASHTAGS_ENABLED_VIDEO"), False),
+        "link_enabled_image":       _parse_bool(setting("LINK_ENABLED_IMAGE"), True),
+        "link_enabled_video":       _parse_bool(setting("LINK_ENABLED_VIDEO"), True),
+        "link_percentage":          _parse_pct(setting("LINK_PERCENTAGE"), 1.0),
+        "max_image_bytes":          int(_parse_plain_float(setting("MAX_IMAGE_MB"), 2.0) * 1024 * 1024),
+        "enable_report":            _parse_bool(setting("ENABLE_REPORT"), False),
+        "top_posts_count":          _parse_int(setting("TOP_POSTS_COUNT"), 5),
+        "top_posts_within":         _parse_int(setting("TOP_POSTS_WITHIN"), 30),
+        "post_plan_sheet_name":     setting("POST_PLAN_SHEET_NAME") or "Sheet1",
+
+        # Soft cross-repo lock bookkeeping (optional columns)
+        "locked_by": col("LOCKED_BY"),
+        "locked_at": col("LOCKED_AT"),
     }
 
     if not cfg["handle"]:
@@ -255,6 +502,77 @@ def load_account_config():
 
 def _cfg():
     return load_account_config()
+
+def refresh_account_config():
+    """Force a fresh read of Sheet1 for this account row. Call at the start
+    of every posting cycle so sheet edits (ratios, toggles, etc.) apply
+    immediately, even mid-job."""
+    return load_account_config(force_refresh=True)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  CROSS-REPO SOFT LOCK
+#  Prevents two different repos/runners from posting for the same account
+#  row at the same time. Purely opt-in: add LOCKED_BY / LOCKED_AT columns to
+#  Sheet1 to enable it; leave them out and this is a no-op.
+#
+#  NOTE: this is a different mechanism from auto row-assignment above.
+#  Assignment decides "which row does this repo own, forever". This lock
+#  decides "is it safe for me to post right this second", in case two
+#  runners somehow ended up pointed at the same row.
+# ═══════════════════════════════════════════════════════════════════════════
+
+class AccountLockedElsewhereError(Exception):
+    """Non-fatal — another repo currently owns this account row. Exit cleanly,
+    schedule keeps running, and we'll try again next scheduled run."""
+
+
+def _write_lock_heartbeat(owner, ts):
+    try:
+        service = get_sheets_service()
+        by_col  = _col_letter(_creds_lock_col_by)
+        at_col  = _col_letter(_creds_lock_col_at)
+        sheet_row = ACCOUNT_ROW + 1  # +1 because row 1 in the sheet is the header
+        service.spreadsheets().values().update(
+            spreadsheetId=MASTER_SHEET_ID,
+            range=f"{CREDS_TAB}!{by_col}{sheet_row}:{at_col}{sheet_row}",
+            valueInputOption="RAW",
+            body={"values": [[owner, ts]]},
+        ).execute()
+        if _account_config:
+            _account_config["locked_by"] = owner
+            _account_config["locked_at"] = ts
+    except Exception as exc:
+        print(f"Warning: could not write account lock heartbeat: {exc}")
+
+
+def try_acquire_account_lock():
+    """Returns True if it's OK to post right now (we now own the lock, or no
+    lock columns are configured so nothing is enforced). Returns False if
+    another repo owns a still-fresh lock on this row."""
+    cfg = refresh_account_config()
+
+    if _creds_lock_col_by is None or _creds_lock_col_at is None:
+        return True  # sheet has no lock columns configured — nothing to enforce
+
+    locked_by     = cfg.get("locked_by", "")
+    locked_at_raw = cfg.get("locked_at", "")
+
+    stale = True
+    if locked_at_raw:
+        try:
+            locked_at = time.mktime(time.strptime(locked_at_raw, "%Y-%m-%dT%H:%M:%SZ"))
+            stale = (time.time() - locked_at) > LOCK_TTL_MINUTES * 60
+        except ValueError:
+            stale = True
+
+    if locked_by and locked_by != CURRENT_REPO and not stale:
+        print(f"Row {ACCOUNT_ROW} is currently locked by '{locked_by}' "
+              f"(last heartbeat {locked_at_raw} UTC, TTL {LOCK_TTL_MINUTES}m). Skipping this run.")
+        return False
+
+    _write_lock_heartbeat(CURRENT_REPO, time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
+    return True
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -278,23 +596,28 @@ def replace_urls(text):
 
 def print_config_summary():
     cfg = _cfg()
-    print("── Run config ──────────────────────────────────")
+    print("── Run config (live from 'Settings' tab + Sheet1, re-checked every cycle) ──")
     print(f"  Account row:              {cfg['row_num']}  ({_posting_handle()})")
     print(f"  Post link:                {cfg['link_display_text']} -> {cfg['link_url']}")
-    print(f"  Image ratio:              {IMAGE_RATIO:.0%}")
-    print(f"  Video ratio:              {VIDEO_RATIO:.0%}")
-    print(f"  Hashtags on image posts:  {HASHTAGS_ENABLED_IMAGE}")
-    print(f"  Hashtags on video posts:  {HASHTAGS_ENABLED_VIDEO}")
-    print(f"  Link on image posts:      {LINK_ENABLED_IMAGE}")
-    print(f"  Link on video posts:      {LINK_ENABLED_VIDEO}")
-    print(f"  Link inclusion rate:      {LINK_PERCENTAGE:.0%} of eligible posts")
-    print(f"  Max image size:           {MAX_IMAGE_BYTES/(1024*1024):.1f} MB")
-    print(f"  Generate report:          {ENABLE_REPORT}")
-    if ENABLE_REPORT:
-        print(f"  Top posts to report:      {TOP_POSTS_COUNT}")
-        print(f"  Scan last N posts:        {TOP_POSTS_WITHIN}")
-    print(f"  Post-plan tab:            {get_post_plan_tab_name()}")
+    print(f"  Image ratio:              {cfg['image_ratio']:.0%}")
+    print(f"  Video ratio:              {cfg['video_ratio']:.0%}")
+    print(f"  Hashtags on image posts:  {cfg['hashtags_enabled_image']}")
+    print(f"  Hashtags on video posts:  {cfg['hashtags_enabled_video']}")
+    print(f"  Link on image posts:      {cfg['link_enabled_image']}")
+    print(f"  Link on video posts:      {cfg['link_enabled_video']}")
+    print(f"  Link inclusion rate:      {cfg['link_percentage']:.0%} of eligible posts")
+    print(f"  Max image size:           {cfg['max_image_bytes']/(1024*1024):.2f} MB")
+    print(f"  Generate report:          {cfg['enable_report']}")
+    if cfg["enable_report"]:
+        print(f"  Top posts to report:      {cfg['top_posts_count']}")
+        print(f"  Scan last N posts:        {cfg['top_posts_within']}")
+    print(f"  Post-plan tab:            {cfg['post_plan_sheet_name']}")
     print(f"  Google token source:      {'scraped from GOOGLE_TOKEN_URL' if GOOGLE_TOKEN_URL else 'GOOGLE_OAUTH_CREDENTIALS secret'}")
+    if _creds_lock_col_by is not None:
+        print(f"  Cross-repo lock:          enabled (owner={cfg.get('locked_by') or '—'}, "
+              f"last heartbeat={cfg.get('locked_at') or '—'})")
+    else:
+        print("  Cross-repo lock:          disabled (add LOCKED_BY / LOCKED_AT columns to enable)")
     print("─────────────────────────────────────────────────")
 
 
@@ -398,15 +721,15 @@ def generate_follower_report(client, handle, service):
         print(f"Warning: follower report failed: {exc}")
 
 
-def generate_top_posts_report(client, handle, service):
-    """Fetch last TOP_POSTS_WITHIN posts, rank by total engagement
-    (likes + reposts + replies + quotes), write top TOP_POSTS_COUNT rows."""
+def generate_top_posts_report(client, handle, service, top_posts_count, top_posts_within):
+    """Fetch last `top_posts_within` posts, rank by total engagement
+    (likes + reposts + replies + quotes), write top `top_posts_count` rows."""
     today = time.strftime("%Y-%m-%d", time.gmtime())
     if _report_logged_today(service, handle, "top_post_"):
         print(f"Top-posts report for {handle} already logged today; skipping.")
         return
     try:
-        response = client.get_author_feed(actor=handle, limit=TOP_POSTS_WITHIN)
+        response = client.get_author_feed(actor=handle, limit=top_posts_within)
         posts = []
         for item in response.feed:
             if getattr(item, "reason", None) is not None:
@@ -433,7 +756,7 @@ def generate_top_posts_report(client, handle, service):
             print(f"No own posts found for {handle}.")
             return
 
-        top_n = sorted(posts, key=lambda p: p["engagement"], reverse=True)[:TOP_POSTS_COUNT]
+        top_n = sorted(posts, key=lambda p: p["engagement"], reverse=True)[:top_posts_count]
         print(f"\nTop {len(top_n)} posts for {handle} (out of {len(posts)} scanned):")
         rows = []
         for rank, p in enumerate(top_n, start=1):
@@ -453,12 +776,13 @@ def generate_top_posts_report(client, handle, service):
         print(f"Warning: top-posts report failed: {exc}")
 
 
-def run_report(client, handle):
+def run_report(client, handle, cfg):
     try:
         service = get_sheets_service()
         _ensure_report_tab(service)
         generate_follower_report(client, handle, service)
-        generate_top_posts_report(client, handle, service)
+        generate_top_posts_report(client, handle, service,
+                                   cfg["top_posts_count"], cfg["top_posts_within"])
     except Exception as exc:
         print(f"Warning: report generation failed: {exc}")
 
@@ -522,10 +846,11 @@ def get_account_hashtags():
 # ═══════════════════════════════════════════════════════════════════════════
 
 def should_add_link(kind):
-    enabled = LINK_ENABLED_IMAGE if kind == "image" else LINK_ENABLED_VIDEO
+    cfg     = _cfg()
+    enabled = cfg["link_enabled_image"] if kind == "image" else cfg["link_enabled_video"]
     if not enabled:
         return False
-    return random.random() < LINK_PERCENTAGE
+    return random.random() < cfg["link_percentage"]
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -537,15 +862,7 @@ _post_plan_status_col_idx = None
 
 
 def get_post_plan_tab_name():
-    return get_env("POST_PLAN_SHEET_NAME", required=False) or "Sheet1"
-
-
-def _col_letter(idx0):
-    idx, letters = idx0 + 1, ""
-    while idx > 0:
-        idx, rem = divmod(idx - 1, 26)
-        letters  = chr(65 + rem) + letters
-    return letters
+    return _cfg()["post_plan_sheet_name"]
 
 
 def load_post_plan(force_refresh=False):
@@ -657,7 +974,8 @@ def claim_file(service, file_id, current_name):
 
 
 def choose_media_kind():
-    return random.choices(["image", "video"], weights=[IMAGE_RATIO, VIDEO_RATIO], k=1)[0]
+    cfg = _cfg()
+    return random.choices(["image", "video"], weights=[cfg["image_ratio"], cfg["video_ratio"]], k=1)[0]
 
 
 def _download_file(service, file_id, local_path):
@@ -780,8 +1098,9 @@ def fetch_media_matching_plan(preferred_kind, plan):
 
 def compress_image_under_limit(local_path):
     from PIL import Image
+    max_bytes = _cfg()["max_image_bytes"]
     orig = os.path.getsize(local_path)
-    if orig <= MAX_IMAGE_BYTES:
+    if orig <= max_bytes:
         print(f"Image {orig/1024:.0f} KB — no compression needed.")
         return local_path
     img = Image.open(local_path)
@@ -790,7 +1109,7 @@ def compress_image_under_limit(local_path):
     for q in range(90, 20, -10):
         buf = io.BytesIO()
         img.save(buf, format="JPEG", quality=q, optimize=True)
-        if buf.tell() <= MAX_IMAGE_BYTES:
+        if buf.tell() <= max_bytes:
             with open(local_path, "wb") as f: f.write(buf.getvalue())
             print(f"Compressed {orig/1024:.0f} KB → {buf.tell()/1024:.0f} KB (q={q}).")
             return local_path
@@ -800,7 +1119,7 @@ def compress_image_under_limit(local_path):
         r = img.resize((max(1,int(w*scale)), max(1,int(h*scale))), Image.LANCZOS)
         buf = io.BytesIO()
         r.save(buf, format="JPEG", quality=70, optimize=True)
-        if buf.tell() <= MAX_IMAGE_BYTES:
+        if buf.tell() <= max_bytes:
             with open(local_path, "wb") as f: f.write(buf.getvalue())
             print(f"Resized+compressed → {buf.tell()/1024:.0f} KB.")
             return local_path
@@ -904,7 +1223,16 @@ def post_to_bluesky(client, media_name, local_path, kind, caption, tags, add_lin
 # ═══════════════════════════════════════════════════════════════════════════
 
 def run_once():
-    cfg    = _cfg()
+    # Re-read Sheet1 fresh at the top of every cycle so any settings you
+    # changed in Google Sheets (ratios, toggles, link %, report, etc.) apply
+    # right away, and check/refresh the cross-repo posting lock at the same time.
+    cfg = refresh_account_config()
+
+    if not try_acquire_account_lock():
+        raise AccountLockedElsewhereError(
+            f"Account row {ACCOUNT_ROW} is locked by another repo right now."
+        )
+
     handle = cfg["handle"]
 
     print_target_account(handle)
@@ -921,8 +1249,8 @@ def run_once():
             ) from exc
         raise
 
-    if ENABLE_REPORT:
-        run_report(client, handle)
+    if cfg["enable_report"]:
+        run_report(client, handle, cfg)
 
     plan = load_post_plan()
     if not plan:
@@ -940,18 +1268,17 @@ def run_once():
         raise NoMediaFoundError("No unposted Drive file matching the post-plan sheet.")
 
     original_name = file["original_name"]
-    post_succeeded = False
 
     try:
         if kind == "image":
             path = compress_image_under_limit(path)
 
-        hashtags_on = HASHTAGS_ENABLED_IMAGE if kind == "image" else HASHTAGS_ENABLED_VIDEO
+        cfg = _cfg()  # re-fetch in case the sheet changed between fetch and post
+        hashtags_on = cfg["hashtags_enabled_image"] if kind == "image" else cfg["hashtags_enabled_video"]
         tags = get_account_hashtags() if hashtags_on else []
         add_link = should_add_link(kind)
 
         post_to_bluesky(client, original_name, path, kind, caption, tags, add_link)
-        post_succeeded = True
 
     except Exception as exc:
         err = str(exc)
@@ -974,19 +1301,25 @@ def run_once():
 
 
 def main():
+    global ACCOUNT_ROW
     try:
+        ACCOUNT_ROW = resolve_account_row()
         load_account_config()
     except Exception as exc:
         print(f"\n{'='*60}\nFATAL: {exc}\n{'='*60}\n")
         sys.exit(1)
 
     print_config_summary()
-    print(f"Starting loop. Posting every {LOOP_INTERVAL_SECONDS} seconds.")
+    print(f"Starting loop. Posting every {LOOP_INTERVAL_SECONDS} seconds. "
+          f"Settings are re-read from Google Sheets at the start of every cycle.")
 
     while True:
         cycle_start = time.time()
         try:
             run_once()
+        except AccountLockedElsewhereError as exc:
+            print(f"\n{'='*60}\n{exc}\nSkipping — schedule keeps running.\n{'='*60}\n")
+            sys.exit(0)
         except NoMediaFoundError as exc:
             print(f"\n{'='*60}\nNO MEDIA: {exc}\nStopping — schedule keeps running.\n{'='*60}\n")
             sys.exit(0)
