@@ -1,61 +1,26 @@
 name: Bluesky Auto Poster
+
 on:
   schedule:
     - cron: "0 */6 * * *"
   workflow_dispatch:
     inputs:
       account_row:
-        description: "Account row number from Sheet1 (1 = first account after header)"
-        default: "1"
-      post_plan_sheet_name:
-        description: "Post-plan tab name (File Name / Caption / Status)"
-        default: "Sheet1"
-      image_ratio:
-        description: "Image post % (e.g. 60)"
-        default: "60"
-      video_ratio:
-        description: "Video post % (e.g. 40)"
-        default: "40"
-      hashtags_enabled_image:
-        description: "Hashtags on image posts?"
-        default: "true"
-        type: choice
-        options: ["true", "false"]
-      hashtags_enabled_video:
-        description: "Hashtags on video posts?"
-        default: "false"
-        type: choice
-        options: ["true", "false"]
-      link_enabled_image:
-        description: "Allow link on image posts?"
-        default: "true"
-        type: choice
-        options: ["true", "false"]
-      link_enabled_video:
-        description: "Allow link on video posts?"
-        default: "true"
-        type: choice
-        options: ["true", "false"]
-      link_percentage:
-        description: "Of the eligible posts above, what % should actually include the link? (e.g. 20, 30, 100)"
-        default: "100"
-      max_image_mb:
-        description: "Max image size in MB before compression"
-        default: "2"
-      enable_report:
-        description: "Generate follower + top posts report?"
-        default: "false"
-        type: choice
-        options: ["false", "true"]
-      top_posts_count:
-        description: "How many top posts to report (only when report enabled)"
-        default: "5"
-      top_posts_within:
-        description: "Scan last N posts to find top ones (only when report enabled)"
-        default: "30"
+        description: >
+          OPTIONAL. Leave this blank to let the script auto-claim the next
+          free (not "In Use") row in Sheet1 and permanently bind it to this
+          repo (ASSIGNED_REPO / ASSIGNED_STATUS columns). Only fill this in
+          if you want to force this run onto one specific row number,
+          overriding auto-assignment (e.g. "3" = third data row after the
+          header). All other settings (ratios, hashtags, links, report,
+          etc.) live in Sheet1/Settings and are re-read every posting cycle.
+        required: false
+        default: ""
+
 concurrency:
   group: bluesky-poster
   cancel-in-progress: false
+
 jobs:
   post:
     runs-on: ubuntu-latest
@@ -64,30 +29,34 @@ jobs:
       actions: write
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v4
         with:
           python-version: "3.11"
+
       - name: Install dependencies
         run: pip install google-api-python-client google-auth-httplib2 google-auth-oauthlib atproto Pillow requests beautifulsoup4
+
       - name: Run poster loop
         run: python -u postnow_status_post.py
         env:
           PYTHONUNBUFFERED: "1"
-          # Token URL is hardcoded inside postnow_status_post.py — no secret
-          # or repo variable needed. Nothing to configure here.
-          ACCOUNT_ROW:            ${{ github.event.inputs.account_row            || vars.ACCOUNT_ROW            || '1' }}
-          POST_PLAN_SHEET_NAME:   ${{ github.event.inputs.post_plan_sheet_name   || vars.POST_PLAN_SHEET_NAME   || 'Sheet1' }}
-          IMAGE_RATIO:            ${{ github.event.inputs.image_ratio            || vars.IMAGE_RATIO            || '60' }}
-          VIDEO_RATIO:            ${{ github.event.inputs.video_ratio            || vars.VIDEO_RATIO            || '40' }}
-          HASHTAGS_ENABLED_IMAGE: ${{ github.event.inputs.hashtags_enabled_image || vars.HASHTAGS_ENABLED_IMAGE || 'true' }}
-          HASHTAGS_ENABLED_VIDEO: ${{ github.event.inputs.hashtags_enabled_video || vars.HASHTAGS_ENABLED_VIDEO || 'false' }}
-          LINK_ENABLED_IMAGE:     ${{ github.event.inputs.link_enabled_image     || vars.LINK_ENABLED_IMAGE     || 'true' }}
-          LINK_ENABLED_VIDEO:     ${{ github.event.inputs.link_enabled_video     || vars.LINK_ENABLED_VIDEO     || 'true' }}
-          LINK_PERCENTAGE:        ${{ github.event.inputs.link_percentage        || vars.LINK_PERCENTAGE        || '100' }}
-          MAX_IMAGE_MB:           ${{ github.event.inputs.max_image_mb           || vars.MAX_IMAGE_MB           || '2' }}
-          ENABLE_REPORT:          ${{ github.event.inputs.enable_report          || vars.ENABLE_REPORT          || 'false' }}
-          TOP_POSTS_COUNT:        ${{ github.event.inputs.top_posts_count        || vars.TOP_POSTS_COUNT        || '5' }}
-          TOP_POSTS_WITHIN:       ${{ github.event.inputs.top_posts_within       || vars.TOP_POSTS_WITHIN       || '30' }}
+          # Token URL is hardcoded inside postnow_status_post.py — nothing
+          # to configure here.
+          #
+          # IMPORTANT: no "|| '1'" fallback here on purpose. If neither a
+          # manual input nor a repo variable is set, ACCOUNT_ROW resolves to
+          # an EMPTY string, which the script treats as "not explicitly
+          # set" -> it falls through to auto-assignment (claims the first
+          # free row and remembers it for this repo forever after).
+          #
+          # If you want to permanently pin THIS repo to a specific row
+          # instead of relying on auto-assignment, set a repo variable:
+          #   Settings -> Secrets and variables -> Actions -> Variables
+          #   -> New repository variable -> ACCOUNT_ROW = 3
+          # A manual workflow_dispatch input, if filled in, wins over both.
+          ACCOUNT_ROW: ${{ github.event.inputs.account_row || vars.ACCOUNT_ROW }}
+
       - name: Disable workflow on permanent failure
         if: failure()
         run: gh workflow disable "${{ github.workflow }}"
