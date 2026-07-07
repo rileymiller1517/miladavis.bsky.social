@@ -1159,37 +1159,63 @@ def release_claim(file_id, original_name):
 LOOP_INTERVAL_SECONDS = 1800
 
 
+MAX_POST_GRAPHEMES = 300
+
 def build_post_from_caption(caption, tags, add_link):
-    tb  = TextBuilder()
-    cfg = _cfg()
+    cfg  = _cfg()
     text = replace_mentions(caption) if caption else ""
 
-    if add_link:
-        m = _URL_RE.search(text)
-        if m:
-            before = text[:m.start()].rstrip()
-            after  = _URL_RE.sub("", text[m.end():]).strip()
-            if before:
-                tb.text(before + " ")
-            tb.link(cfg["link_display_text"], cfg["link_url"])
-            if after:
-                tb.text(" " + after)
+    def _assemble(caption_text):
+        tb = TextBuilder()
+        if add_link:
+            m = _URL_RE.search(caption_text)
+            if m:
+                before = caption_text[:m.start()].rstrip()
+                after  = _URL_RE.sub("", caption_text[m.end():]).strip()
+                if before:
+                    tb.text(before + " ")
+                tb.link(cfg["link_display_text"], cfg["link_url"])
+                if after:
+                    tb.text(" " + after)
+            else:
+                if caption_text:
+                    tb.text(caption_text)
+                    tb.text("\n\n")
+                tb.link(cfg["link_display_text"], cfg["link_url"])
         else:
-            if text:
-                tb.text(text)
-                tb.text("\n\n")
-            tb.link(cfg["link_display_text"], cfg["link_url"])
-    else:
-        text_no_url = _URL_RE.sub("", text).strip()
-        if text_no_url:
-            tb.text(text_no_url)
+            text_no_url = _URL_RE.sub("", caption_text).strip()
+            if text_no_url:
+                tb.text(text_no_url)
 
-    if tags:
-        tb.text("\n\n")
-        for i, tag in enumerate(tags):
-            tb.tag(f"#{tag}", tag)
-            if i < len(tags) - 1:
-                tb.text(" ")
+        if tags:
+            tb.text("\n\n")
+            for i, tag in enumerate(tags):
+                tb.tag(f"#{tag}", tag)
+                if i < len(tags) - 1:
+                    tb.text(" ")
+        return tb
+
+    tb    = _assemble(text)
+    plain = tb.build_text()
+
+    if len(plain) > MAX_POST_GRAPHEMES:
+        # Binary-search the longest caption prefix that still fits once
+        # the link + hashtags are added back in.
+        lo, hi, best_text = 0, len(text), ""
+        while lo <= hi:
+            mid   = (lo + hi) // 2
+            trial = text[:mid].rstrip()
+            if mid < len(text):
+                trial += "…"
+            if len(_assemble(trial).build_text()) <= MAX_POST_GRAPHEMES:
+                best_text = trial
+                lo = mid + 1
+            else:
+                hi = mid - 1
+        print(f"Caption too long for post limit ({len(plain)} > {MAX_POST_GRAPHEMES}); "
+              f"trimmed caption to fit.")
+        tb = _assemble(best_text)
+
     return tb
 
 
