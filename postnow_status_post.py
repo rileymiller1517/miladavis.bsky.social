@@ -359,7 +359,8 @@ def _claim_account_row(service, data_idx, repo_idx, status_idx, at_idx):
 #
 #  IMAGE_RATIO | VIDEO_RATIO | HASHTAGS_ENABLED_IMAGE | HASHTAGS_ENABLED_VIDEO |
 #  LINK_ENABLED_IMAGE | LINK_ENABLED_VIDEO | LINK_PERCENTAGE | MAX_IMAGE_MB |
-#  ENABLE_REPORT | TOP_POSTS_COUNT | TOP_POSTS_WITHIN | POST_PLAN_SHEET_NAME
+#  ENABLE_REPORT | TOP_POSTS_COUNT | TOP_POSTS_WITHIN | POST_PLAN_SHEET_NAME |
+#  LOOP_INTERVAL_SECONDS
 #
 #  Any value can be left blank — a sensible built-in default is used.
 #  The Settings tab is entirely optional too: if it doesn't exist yet,
@@ -371,6 +372,10 @@ _account_config         = None
 _creds_lock_col_by      = None
 _creds_lock_col_at      = None
 _global_settings_cache  = None
+
+# Fallback used only if the Settings tab is missing/unreadable or the
+# LOOP_INTERVAL_SECONDS key isn't set there yet.
+DEFAULT_LOOP_INTERVAL_SECONDS = 1800
 
 
 def load_global_settings(force_refresh=False):
@@ -472,8 +477,8 @@ def load_account_config(force_refresh=False):
         "row_num":             ACCOUNT_ROW,
 
         # Live-tunable settings — edit these in the sheet any time; they
-        # take effect on the next posting cycle (checked every ~30 min
-        # while a job is running, and again on every new scheduled run).
+        # take effect on the next posting cycle (checked every cycle while
+        # a job is running, and again on every new scheduled run).
         "image_ratio":              image_ratio,
         "video_ratio":              video_ratio,
         "hashtags_enabled_image":   _parse_bool(setting("HASHTAGS_ENABLED_IMAGE"), True),
@@ -486,6 +491,8 @@ def load_account_config(force_refresh=False):
         "top_posts_count":          _parse_int(setting("TOP_POSTS_COUNT"), 5),
         "top_posts_within":         _parse_int(setting("TOP_POSTS_WITHIN"), 30),
         "post_plan_sheet_name":     setting("POST_PLAN_SHEET_NAME") or "Sheet1",
+        "loop_interval_seconds":    _parse_int(setting("LOOP_INTERVAL_SECONDS"),
+                                                DEFAULT_LOOP_INTERVAL_SECONDS),
 
         # Soft cross-repo lock bookkeeping (optional columns)
         "locked_by": col("LOCKED_BY"),
@@ -505,8 +512,8 @@ def _cfg():
 
 def refresh_account_config():
     """Force a fresh read of Sheet1 for this account row. Call at the start
-    of every posting cycle so sheet edits (ratios, toggles, etc.) apply
-    immediately, even mid-job."""
+    of every posting cycle so sheet edits (ratios, toggles, loop interval,
+    etc.) apply immediately, even mid-job."""
     return load_account_config(force_refresh=True)
 
 
@@ -607,6 +614,7 @@ def print_config_summary():
     print(f"  Link on video posts:      {cfg['link_enabled_video']}")
     print(f"  Link inclusion rate:      {cfg['link_percentage']:.0%} of eligible posts")
     print(f"  Max image size:           {cfg['max_image_bytes']/(1024*1024):.2f} MB")
+    print(f"  Loop interval:            {cfg['loop_interval_seconds']}s ({cfg['loop_interval_seconds']/60:.1f} min)")
     print(f"  Generate report:          {cfg['enable_report']}")
     if cfg["enable_report"]:
         print(f"  Top posts to report:      {cfg['top_posts_count']}")
@@ -1156,9 +1164,6 @@ def release_claim(file_id, original_name):
 #  POST BUILDING
 # ═══════════════════════════════════════════════════════════════════════════
 
-LOOP_INTERVAL_SECONDS = 1800
-
-
 MAX_POST_GRAPHEMES = 300
 
 def build_post_from_caption(caption, tags, add_link):
@@ -1250,8 +1255,9 @@ def post_to_bluesky(client, media_name, local_path, kind, caption, tags, add_lin
 
 def run_once():
     # Re-read Sheet1 fresh at the top of every cycle so any settings you
-    # changed in Google Sheets (ratios, toggles, link %, report, etc.) apply
-    # right away, and check/refresh the cross-repo posting lock at the same time.
+    # changed in Google Sheets (ratios, toggles, link %, report, loop
+    # interval, etc.) apply right away, and check/refresh the cross-repo
+    # posting lock at the same time.
     cfg = refresh_account_config()
 
     if not try_acquire_account_lock():
@@ -1336,8 +1342,9 @@ def main():
         sys.exit(1)
 
     print_config_summary()
-    print(f"Starting loop. Posting every {LOOP_INTERVAL_SECONDS} seconds. "
-          f"Settings are re-read from Google Sheets at the start of every cycle.")
+    print(f"Starting loop. Loop interval is read from the Settings tab "
+          f"(LOOP_INTERVAL_SECONDS) and re-checked at the start of every cycle "
+          f"— edit it in Google Sheets any time, no redeploy needed.")
 
     while True:
         cycle_start = time.time()
@@ -1361,9 +1368,15 @@ def main():
         except Exception as exc:
             print(f"Error during cycle: {exc}")
 
+        # Loop interval is re-read from the Settings tab every cycle via
+        # refresh_account_config() inside run_once(), so changing
+        # LOOP_INTERVAL_SECONDS in the sheet takes effect on the very next
+        # sleep — no code change or redeploy required.
+        loop_interval = (_account_config or {}).get("loop_interval_seconds", DEFAULT_LOOP_INTERVAL_SECONDS)
         elapsed   = time.time() - cycle_start
-        sleep_for = max(0, LOOP_INTERVAL_SECONDS - elapsed)
-        print(f"Cycle done in {elapsed:.1f}s. Sleeping {sleep_for:.1f}s…")
+        sleep_for = max(0, loop_interval - elapsed)
+        print(f"Cycle done in {elapsed:.1f}s. Sleeping {sleep_for:.1f}s "
+              f"(interval={loop_interval}s from Settings tab)…")
         time.sleep(sleep_for)
 
 
