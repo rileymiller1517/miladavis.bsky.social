@@ -418,6 +418,7 @@ def load_account_config(force_refresh=False):
             "Add at least one account data row."
         )
 
+    # ACCOUNT_ROW=1 -> values index 1 (first data row after the header)
     data_idx = ACCOUNT_ROW
     if data_idx >= len(values):
         raise RuntimeError(
@@ -437,24 +438,18 @@ def load_account_config(force_refresh=False):
                 continue
         return ""
 
+    # Remember which columns hold the soft-lock fields, if present, so we
+    # can write heartbeats back to the right cells later.
     _creds_lock_col_by = header.index("LOCKED_BY") if "LOCKED_BY" in header else None
     _creds_lock_col_at = header.index("LOCKED_AT") if "LOCKED_AT" in header else None
 
+    # Shared, live-tunable knobs come from the Settings tab. A row in Sheet1
+    # can still override any of these for just that one account by adding a
+    # column of the same name — a per-row value always wins over the shared
+    # Settings tab value, which wins over the built-in default.
     shared = load_global_settings(force_refresh)
-
-    # NEW: track where each live-tunable value actually came from, so we can
-    # print it and immediately see if a per-row override is being picked up
-    # or silently ignored (wrong row, wrong header name, etc).
-    setting_sources = {}
-
     def setting(key):
-        row_val = col(key)
-        if row_val != "":
-            setting_sources[key] = f"row override = {row_val!r}"
-            return row_val
-        shared_val = shared.get(key, "")
-        setting_sources[key] = f"Settings tab = {shared_val!r}" if shared_val != "" else "built-in default"
-        return shared_val
+        return col(key) or shared.get(key, "")
 
     raw_link     = col("LINK_URL") or "https://foodiesposts.com"
     link_url     = raw_link if raw_link.startswith("http") else f"https://{raw_link}"
@@ -476,6 +471,9 @@ def load_account_config(force_refresh=False):
         "processed_folder_id": col("PROCESSED_FOLDER_ID"),
         "row_num":             ACCOUNT_ROW,
 
+        # Live-tunable settings — edit these in the sheet any time; they
+        # take effect on the next posting cycle (checked every ~30 min
+        # while a job is running, and again on every new scheduled run).
         "image_ratio":              image_ratio,
         "video_ratio":              video_ratio,
         "hashtags_enabled_image":   _parse_bool(setting("HASHTAGS_ENABLED_IMAGE"), True),
@@ -489,10 +487,9 @@ def load_account_config(force_refresh=False):
         "top_posts_within":         _parse_int(setting("TOP_POSTS_WITHIN"), 30),
         "post_plan_sheet_name":     setting("POST_PLAN_SHEET_NAME") or "Sheet1",
 
+        # Soft cross-repo lock bookkeeping (optional columns)
         "locked_by": col("LOCKED_BY"),
         "locked_at": col("LOCKED_AT"),
-
-        "_setting_sources": setting_sources,  # NEW
     }
 
     if not cfg["handle"]:
@@ -621,10 +618,6 @@ def print_config_summary():
               f"last heartbeat={cfg.get('locked_at') or '—'})")
     else:
         print("  Cross-repo lock:          disabled (add LOCKED_BY / LOCKED_AT columns to enable)")
-    print("─────────────────────────────────────────────────")
-    print("── Value sources (per-row override vs Settings tab vs built-in default) ──")
-    for key, src in cfg.get("_setting_sources", {}).items():
-        print(f"  {key:<28} {src}")
     print("─────────────────────────────────────────────────")
 
 
